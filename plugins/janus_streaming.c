@@ -820,7 +820,9 @@ static struct janus_json_parameter rtsp_parameters[] = {
 	{"videortpmap", JSON_STRING, 0},
 	{"videofmtp", JSON_STRING, 0},
 	{"rtspiface", JSON_STRING, 0},
-	{"rtsp_failcheck", JANUS_JSON_BOOL, 0}
+	{"rtsp_failcheck", JANUS_JSON_BOOL, 0},
+	{"rtsp_audio_port", JSON_INTEGER, 0},
+	{"rtsp_video_port", JSON_INTEGER, 0},
 };
 #endif
 static struct janus_json_parameter rtp_audio_parameters[] = {
@@ -1006,6 +1008,8 @@ typedef struct janus_streaming_rtp_source {
 	char *rtsp_username, *rtsp_password;
 	int ka_timeout;
 	char *rtsp_ahost, *rtsp_vhost;
+	int rtsp_audio_port;
+	int rtsp_video_port;
 	gboolean reconnecting;
 	gint64 reconnect_timer;
 	janus_mutex rtsp_mutex;
@@ -1105,7 +1109,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		gboolean doaudio, char *artpmap, char *afmtp,
 		gboolean dovideo, char *vrtpmap, char *vfmtp,
 		const janus_network_address *iface,
-		gboolean error_on_failure);
+		gboolean error_on_failure, int rtsp_audio_port, int rtsp_video_port);
 
 
 typedef struct janus_streaming_message {
@@ -1728,6 +1732,8 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 				janus_config_item *vfmtp = janus_config_get(config, cat, janus_config_type_item, "videofmtp");
 				janus_config_item *iface = janus_config_get(config, cat, janus_config_type_item, "rtspiface");
 				janus_config_item *failerr = janus_config_get(config, cat, janus_config_type_item, "rtsp_failcheck");
+				janus_config_item *rtsp_audio_port = janus_config_get(config, cat, janus_config_type_item, "rtsp_audio_port");
+				janus_config_item *rtsp_video_port = janus_config_get(config, cat, janus_config_type_item, "rtsp_video_port");
 				janus_network_address iface_value;
 				if(file == NULL || file->value == NULL) {
 					JANUS_LOG(LOG_ERR, "Can't add 'rtsp' stream '%s', missing mandatory information...\n", cat->name);
@@ -1782,7 +1788,9 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 						vrtpmap ? (char *)vrtpmap->value : NULL,
 						vfmtp ? (char *)vfmtp->value : NULL,
 						iface && iface->value ? &iface_value : NULL,
-						error_on_failure)) == NULL) {
+						error_on_failure,
+						(rtsp_audio_port && rtsp_audio_port->value) ? strtol(rtsp_audio_port->value, 0, 10) : 0,
+						(rtsp_video_port && rtsp_video_port->value) ? strtol(rtsp_video_port->value, 0, 10) : 0)) == NULL) {
 					JANUS_LOG(LOG_ERR, "Error creating 'rtsp' stream '%s'...\n", cat->name);
 					cl = cl->next;
 					continue;
@@ -2628,6 +2636,8 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 			json_t *password = json_object_get(root, "rtsp_pwd");
 			json_t *iface = json_object_get(root, "rtspiface");
 			json_t *failerr = json_object_get(root, "rtsp_check");
+			json_t *rtsp_audio_port = json_object_get(root, "rtsp_audio_port");
+			json_t *rtsp_video_port = json_object_get(root, "rtsp_video_port");
 			gboolean doaudio = audio ? json_is_true(audio) : FALSE;
 			gboolean dovideo = video ? json_is_true(video) : FALSE;
 			gboolean error_on_failure = failerr ? json_is_true(failerr) : TRUE;
@@ -2659,7 +2669,9 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 					doaudio, (char *)json_string_value(audiortpmap), (char *)json_string_value(audiofmtp),
 					dovideo, (char *)json_string_value(videortpmap), (char *)json_string_value(videofmtp),
 					&multicast_iface,
-					error_on_failure);
+					error_on_failure,
+					rtsp_audio_port ? json_integer_value(rtsp_audio_port): 0,
+					rtsp_video_port ? json_integer_value(rtsp_video_port): 0);
 			if(mp == NULL) {
 				JANUS_LOG(LOG_ERR, "Error creating 'rtsp' stream...\n");
 				error_code = JANUS_STREAMING_ERROR_CANT_CREATE;
@@ -4999,7 +5011,7 @@ static size_t janus_streaming_rtsp_curl_callback(void *payload, size_t size, siz
 }
 
 static int janus_streaming_rtsp_parse_sdp(const char *buffer, const char *name, const char *media, int *pt,
-		char *transport, char *host, char *rtpmap, char *fmtp, char *control, const janus_network_address *iface, multiple_fds *fds) {
+		char *transport, char *host, char *rtpmap, char *fmtp, char *control, const janus_network_address *iface, multiple_fds *fds, int bind_port) {
 	char pattern[256];
 	g_snprintf(pattern, sizeof(pattern), "m=%s", media);
 	char *m = strstr(buffer, pattern);
@@ -5043,7 +5055,7 @@ static int janus_streaming_rtsp_parse_sdp(const char *buffer, const char *name, 
 	socklen_t len = sizeof(address);
 	/* loop until can bind two adjacent ports for RTP and RTCP */
 	do {
-		fds->fd = janus_streaming_create_fd(41234, mcast, iface, media, media, name);
+		fds->fd = janus_streaming_create_fd(bind_port, mcast, iface, media, media, name);
 		if(fds->fd < 0) {
 			return -1;
 		}
@@ -5090,6 +5102,8 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 	char *name = mp->name;
 	gboolean doaudio = mp->audio;
 	gboolean dovideo = mp->video;
+	int rtsp_audio_port = source->rtsp_audio_port;
+	int rtsp_video_port = source->rtsp_video_port;
 
 	CURL *curl = curl_easy_init();
 	if(curl == NULL) {
@@ -5166,15 +5180,14 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 	char ahost[256];
 	int asport = 0, asport_rtcp = 0;
 	multiple_fds audio_fds = {-1, -1};
-
 	/* Parse both video and audio first before proceed to setup as curldata will be reused */
 	int vresult;
 	vresult = janus_streaming_rtsp_parse_sdp(curldata->buffer, name, "video", &vpt,
-		vtransport, vhost, vrtpmap, vfmtp, vcontrol, &source->video_iface, &video_fds);
+		vtransport, vhost, vrtpmap, vfmtp, vcontrol, &source->video_iface, &video_fds, rtsp_video_port);
 
 	int aresult;
 	aresult = janus_streaming_rtsp_parse_sdp(curldata->buffer, name, "audio", &apt,
-		atransport, ahost, artpmap, afmtp, acontrol, &source->audio_iface, &audio_fds);
+		atransport, ahost, artpmap, afmtp, acontrol, &source->audio_iface, &audio_fds, rtsp_audio_port);
 
 	if(vresult != -1) {
 		/* Send an RTSP SETUP for video */
@@ -5428,7 +5441,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		gboolean doaudio, char *artpmap, char *afmtp,
 		gboolean dovideo, char *vrtpmap, char *vfmtp,
 		const janus_network_address *iface,
-		gboolean error_on_failure) {
+		gboolean error_on_failure, int rtsp_audio_port, int rtsp_video_port) {
 	if(url == NULL) {
 		JANUS_LOG(LOG_ERR, "Can't add 'rtsp' stream, missing url...\n");
 		return NULL;
@@ -5481,6 +5494,8 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 	live_rtsp_source->rtsp_url = g_strdup(url);
 	live_rtsp_source->rtsp_username = username ? g_strdup(username) : NULL;
 	live_rtsp_source->rtsp_password = password ? g_strdup(password) : NULL;
+	live_rtsp_source->rtsp_audio_port = rtsp_audio_port;
+	live_rtsp_source->rtsp_video_port = rtsp_video_port;
 	live_rtsp_source->arc = NULL;
 	live_rtsp_source->vrc = NULL;
 	live_rtsp_source->drc = NULL;
@@ -5552,7 +5567,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		gboolean doaudio, char *audiortpmap, char *audiofmtp,
 		gboolean dovideo, char *videortpmap, char *videofmtp,
 		const janus_network_address *iface,
-		gboolean error_on_failure) {
+		gboolean error_on_failure, int rtsp_audio_port, int rtsp_video_port) {
 	JANUS_LOG(LOG_ERR, "RTSP need libcurl\n");
 	return NULL;
 }
